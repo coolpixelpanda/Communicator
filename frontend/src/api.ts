@@ -1,6 +1,6 @@
 import type { AuthResponse, MessageDto, UnreadCountDto, UserDto } from "./types";
 
-const BASE = "/api";
+const BASE = (import.meta.env.VITE_API_URL as string) || "/api";
 
 /**
  * In-memory token used by all API calls. Set via setApiToken() from AuthContext.
