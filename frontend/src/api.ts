@@ -23,6 +23,9 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const res = await fetch(`${BASE}${path}`, { ...options, headers });
 
   if (!res.ok) {
+    if (res.status === 404 && BASE === "/api" && typeof window !== "undefined" && !window.location.hostname.includes("localhost")) {
+      throw new Error("Backend not configured. Set VITE_API_URL in Vercel to your API URL and redeploy. See DEPLOY.md.");
+    }
     const body = await res.json().catch(() => ({}));
     throw new Error(body.error ?? `Request failed (${res.status})`);
   }

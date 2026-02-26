@@ -32,11 +32,13 @@ builder.Services
         };
     });
 
+var allowedOrigins = builder.Configuration["AllowedOrigins"]
+    ?? "http://localhost:5173";
 builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy =>
     {
-        policy.WithOrigins("http://localhost:5173")
+        policy.WithOrigins(allowedOrigins.Split(';', StringSplitOptions.RemoveEmptyEntries))
               .AllowAnyHeader()
               .AllowAnyMethod();
     });
