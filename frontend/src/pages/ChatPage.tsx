@@ -4,6 +4,7 @@ import { api } from "../api";
 import { usePolling } from "../hooks/usePolling";
 import { useOfflineQueue } from "../hooks/useOfflineQueue";
 import { useNotifications } from "../hooks/useNotifications";
+import { stripHtmlToText } from "../utils/sanitize";
 import Avatar from "../components/Avatar";
 import UserList from "../components/UserList";
 import ChatWindow from "../components/ChatWindow";
@@ -46,18 +47,20 @@ export default function ChatPage() {
     };
   }, []);
 
-  // Real-time user list polling
+  // Real-time user list polling (only when logged in)
   useEffect(() => {
+    if (!auth) return;
     const fetchUsers = () => {
       api.getUsers().then(setUsers).catch(() => {});
     };
     fetchUsers();
     const id = setInterval(fetchUsers, USER_POLL_MS);
     return () => clearInterval(id);
-  }, []);
+  }, [auth]);
 
-  // Unread counts polling
+  // Unread counts polling (only when logged in)
   useEffect(() => {
+    if (!auth) return;
     const fetchUnread = () => {
       api
         .getUnreadCounts()
@@ -71,7 +74,7 @@ export default function ChatPage() {
     fetchUnread();
     const id = setInterval(fetchUnread, UNREAD_POLL_MS);
     return () => clearInterval(id);
-  }, []);
+  }, [auth]);
 
   // Load conversation + mark as read on user select
   useEffect(() => {
@@ -105,18 +108,26 @@ export default function ChatPage() {
         return fresh.length > 0 ? [...prev, ...fresh] : prev;
       });
 
-      // Desktop notifications for messages from users other than the current conversation
       for (const msg of incoming) {
         const fromCurrentConversation = current && msg.senderId === current.id;
         if (fromCurrentConversation) {
-          api.markAsRead(current!.id).catch(() => {});
+          api.markAsRead(current!.id).then(() => {
+            setUnreadCounts((prev) => {
+              if (!prev[current!.id]) return prev;
+              const next = { ...prev };
+              delete next[current!.id];
+              return next;
+            });
+          }).catch(() => {});
         } else {
+          setUnreadCounts((prev) => ({
+            ...prev,
+            [msg.senderId]: (prev[msg.senderId] ?? 0) + 1,
+          }));
           const sender = usersRef.current.find((u) => u.id === msg.senderId);
           const senderName = sender?.username ?? "Someone";
-          const preview =
-            msg.content.length > 60
-              ? msg.content.slice(0, 60) + "..."
-              : msg.content;
+          const plain = stripHtmlToText(msg.content);
+          const preview = plain.length > 60 ? plain.slice(0, 60) + "..." : plain;
           notify(`New message from ${senderName}`, preview);
         }
       }

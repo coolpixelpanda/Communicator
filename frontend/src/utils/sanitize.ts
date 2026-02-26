@@ -12,6 +12,12 @@ const ALLOWED_ATTRS: Record<string, Set<string>> = {
   pre: new Set(["class"]),
 };
 
+/** Returns plain text from HTML (e.g. for notification previews). */
+export function stripHtmlToText(html: string): string {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  return doc.body.textContent?.trim().replace(/\s+/g, " ") ?? "";
+}
+
 /**
  * Simple HTML sanitizer that keeps only safe tags and attributes.
  * For production, use DOMPurify. This is sufficient for a demo.
