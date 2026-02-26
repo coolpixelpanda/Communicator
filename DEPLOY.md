@@ -1,38 +1,21 @@
-# Deploy Communicator (fix 404 on register/login)
+# Deploy Communicator (Vercel only)
 
-The frontend on Vercel gets **404** for `/api/*` because the **backend is not on Vercel**. Deploy the backend and point the frontend to it.
+The app can run **entirely on Vercel**: the frontend and a Node.js API (in `api/`) are both deployed with the same project.
 
-## 1. Deploy the backend (Railway or Render)
+## Deploy to Vercel
 
-### Option A: Railway
+1. Push the repo to GitHub and connect it to Vercel.
+2. Deploy. No extra services (e.g. Railway) are required.
 
-1. Go to [railway.app](https://railway.app), sign in with GitHub.
-2. **New Project** → **Deploy from GitHub repo** → select `Communicator`.
-3. Set **Root Directory** to `backend/Communicator.Api`.
-4. Railway will detect .NET. Add **Variables**:
-   - `Jwt__Key` = any secret string (e.g. 32+ chars)
-   - `AllowedOrigins` = `https://communicator-eight.vercel.app` (your Vercel URL, no trailing slash)
-5. Deploy. Copy the public URL (e.g. `https://communicator-production-xxxx.up.railway.app`).
+Register and login use the serverless API at `/api/auth/register` and `/api/auth/login`.
 
-### Option B: Render
+## Optional: Environment variables (Vercel)
 
-1. Go to [render.com](https://render.com), sign in with GitHub.
-2. **New** → **Web Service** → connect `Communicator`.
-3. **Root Directory**: `backend/Communicator.Api`
-4. **Build Command**: `dotnet publish -c Release -o out`
-5. **Start Command**: `dotnet out/Communicator.Api.dll`
-6. **Environment**:
-   - `Jwt__Key` = (your secret key)
-   - `AllowedOrigins` = `https://communicator-eight.vercel.app`
-7. Deploy and copy the service URL.
+In **Vercel** → your project → **Settings** → **Environment Variables** you can set:
 
-## 2. Point the frontend to your backend
+- **`JWT_SECRET`** – Secret used to sign JWTs (defaults to a dev value if unset).
+- **`ALLOWED_ORIGINS`** – Allowed CORS origin (defaults to request origin).
 
-1. In **Vercel** → your project → **Settings** → **Environment Variables**.
-2. Add:
-   - **Name**: `VITE_API_URL`
-   - **Value**: `https://YOUR-BACKEND-URL/api`  
-     (e.g. `https://communicator-production-xxxx.up.railway.app/api`)
-3. **Redeploy** the frontend (Deployments → ⋮ → Redeploy).
+## Alternative: Use the .NET backend elsewhere
 
-After redeploy, register and login will use your backend and the 404 will be fixed.
+To run the C# backend on Railway/Render and the frontend on Vercel, see the repo’s backend `Dockerfile` and set **`VITE_API_URL`** in Vercel to your backend URL + `/api`, then redeploy.
