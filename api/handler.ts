@@ -1,14 +1,14 @@
-import { createHash, randomBytes, pbkdf2Sync } from "crypto";
+import { randomBytes, pbkdf2Sync } from "crypto";
 import jwt from "jsonwebtoken";
+import { get as getBlob, put as putBlob } from "@vercel/blob";
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 const JWT_SECRET = process.env.JWT_SECRET || "ThisIsA32CharSecretKeyForDevOnly!";
 const JWT_ISSUER = "Communicator";
+const BLOB_PREFIX = "communicator";
 
-// In-memory store (shared within same serverless instance; may reset on cold start)
-const users = new Map<string, { id: string; username: string; passwordHash: string }>();
-const usernameToId = new Map<string, string>();
-const messages: Array<{
+type UserRow = { id: string; username: string; passwordHash: string };
+type MessageRow = {
   id: string;
   senderId: string;
   recipientId: string;
@@ -17,8 +17,88 @@ const messages: Array<{
   clientId: string | null;
   isRead: boolean;
   replyToId: string | null;
-}> = [];
+};
+
+// In-memory store (loaded from Blob when BLOB_READ_WRITE_TOKEN is set)
+const users = new Map<string, UserRow>();
+const usernameToId = new Map<string, string>();
+const messages: MessageRow[] = [];
 const clientIds = new Set<string>();
+
+async function streamToText(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const chunks: Uint8Array[] = [];
+  const reader = stream.getReader();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) chunks.push(value);
+    }
+    return Buffer.concat(chunks).toString("utf-8");
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function loadPersistedData(): Promise<void> {
+  const token = process.env.BLOB_READ_WRITE_TOKEN;
+  if (!token) return;
+
+  try {
+    const [usersBlob, messagesBlob] = await Promise.all([
+      getBlob({ urlOrPathname: `${BLOB_PREFIX}/users.json`, access: "private" as const }),
+      getBlob({ urlOrPathname: `${BLOB_PREFIX}/messages.json`, access: "private" as const }),
+    ]);
+
+    if (usersBlob && "stream" in usersBlob && usersBlob.stream) {
+      const text = await streamToText(usersBlob.stream as ReadableStream<Uint8Array>);
+      const list = JSON.parse(text || "[]") as UserRow[];
+      users.clear();
+      usernameToId.clear();
+      for (const u of list) {
+        users.set(u.id, u);
+        usernameToId.set(u.username.toLowerCase(), u.id);
+      }
+    }
+
+    if (messagesBlob && "stream" in messagesBlob && messagesBlob.stream) {
+      const text = await streamToText(messagesBlob.stream as ReadableStream<Uint8Array>);
+      const list = JSON.parse(text || "[]") as MessageRow[];
+      messages.length = 0;
+      messages.push(...list);
+      for (const m of list) if (m.clientId) clientIds.add(m.clientId);
+    }
+  } catch (e) {
+    console.error("Blob load error:", e);
+  }
+}
+
+async function saveUsersToBlob(): Promise<void> {
+  if (!process.env.BLOB_READ_WRITE_TOKEN) return;
+  try {
+    const list = Array.from(users.values());
+    await putBlob(`${BLOB_PREFIX}/users.json`, JSON.stringify(list), {
+      access: "private",
+      addRandomSuffix: false,
+      allowOverwrite: true,
+    });
+  } catch (e) {
+    console.error("Blob save users error:", e);
+  }
+}
+
+async function saveMessagesToBlob(): Promise<void> {
+  if (!process.env.BLOB_READ_WRITE_TOKEN) return;
+  try {
+    await putBlob(`${BLOB_PREFIX}/messages.json`, JSON.stringify(messages), {
+      access: "private",
+      addRandomSuffix: false,
+      allowOverwrite: true,
+    });
+  } catch (e) {
+    console.error("Blob save messages error:", e);
+  }
+}
 
 function uuid() {
   return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
@@ -75,6 +155,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   cors(req, res);
   if (req.method === "OPTIONS") return res.status(204).end();
 
+  // Load persisted users/messages from Vercel Blob when token is set and store is empty
+  if (process.env.BLOB_READ_WRITE_TOKEN && users.size === 0) {
+    await loadPersistedData();
+  }
+
   const path = (req.query.path as string) || "";
   const segments = path.split("/").filter(Boolean);
 
@@ -93,6 +178,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const id = uuid();
       users.set(id, { id, username: name, passwordHash: hashPassword(password) });
       usernameToId.set(key, id);
+      await saveUsersToBlob();
       const token = createToken(id, name);
       return res.status(200).json({ token, userId: id, username: name });
     }
@@ -158,6 +244,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         replyToId: replyToId || null,
       };
       messages.push(msg);
+      await saveMessagesToBlob();
       return res.status(200).json(msg);
     }
 
@@ -201,6 +288,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           count++;
         }
       }
+      await saveMessagesToBlob();
       return res.status(200).json({ markedRead: count });
     }
 
