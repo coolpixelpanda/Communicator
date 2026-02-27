@@ -2,22 +2,26 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { useAuth } from "../context/AuthContext";
 import { api } from "../api";
 import { usePolling } from "../hooks/usePolling";
+import { useChatSocket } from "../hooks/useChatSocket";
 import { useOfflineQueue } from "../hooks/useOfflineQueue";
 import { useNotifications } from "../hooks/useNotifications";
 import { stripHtmlToText } from "../utils/sanitize";
+import { getWsUrl } from "../utils/wsUrl";
 import Avatar from "../components/Avatar";
 import UserList from "../components/UserList";
 import ChatWindow from "../components/ChatWindow";
 import type { UserDto, MessageDto } from "../types";
 
-const USER_POLL_MS = 5000;
+const USER_POLL_MS = 2500;
 const MSG_POLL_MS = 3000;
 const UNREAD_POLL_MS = 4000;
+const EMPTY_RETRY_MS = 1500;
 
 export default function ChatPage() {
   const { auth, logout } = useAuth();
   const { notify } = useNotifications();
   const [users, setUsers] = useState<UserDto[]>([]);
+  const [usersLoaded, setUsersLoaded] = useState(false);
   const [selectedUser, setSelectedUser] = useState<UserDto | null>(null);
   const [messages, setMessages] = useState<MessageDto[]>([]);
   const [online, setOnline] = useState(navigator.onLine);
@@ -47,20 +51,57 @@ export default function ChatPage() {
     };
   }, []);
 
-  // Real-time user list polling (only when logged in)
+  // Real-time user list polling (only when logged in); stable dep so list doesn’t flicker
+  const userId = auth?.userId ?? null;
+  const fetchUsersRef = useRef<() => void>(() => {});
   useEffect(() => {
-    if (!auth) return;
+    if (!userId) {
+      setUsersLoaded(false);
+      return;
+    }
+    let retryTimeout: ReturnType<typeof setTimeout> | null = null;
     const fetchUsers = () => {
-      api.getUsers().then(setUsers).catch(() => {});
+      api
+        .getUsers()
+        .then((list) => {
+          setUsersLoaded(true);
+          setUsers((prev) => {
+            if (list.length === 0 && prev.length > 0) {
+              if (retryTimeout === null) {
+                retryTimeout = setTimeout(() => {
+                  api.getUsers().then((retryList) => setUsers(retryList)).catch(() => {});
+                }, EMPTY_RETRY_MS);
+              }
+              return prev;
+            }
+            return list;
+          });
+        })
+        .catch(() => {});
     };
+    fetchUsersRef.current = fetchUsers;
     fetchUsers();
     const id = setInterval(fetchUsers, USER_POLL_MS);
-    return () => clearInterval(id);
-  }, [auth]);
+    return () => {
+      clearInterval(id);
+      if (retryTimeout) clearTimeout(retryTimeout);
+    };
+  }, [userId]);
+
+  // Refetch user list when tab becomes visible (real-time when returning to app)
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === "visible" && userId && fetchUsersRef.current) {
+        fetchUsersRef.current();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [userId]);
 
   // Unread counts polling (only when logged in)
   useEffect(() => {
-    if (!auth) return;
+    if (!userId) return;
     const fetchUnread = () => {
       api
         .getUnreadCounts()
@@ -74,7 +115,7 @@ export default function ChatPage() {
     fetchUnread();
     const id = setInterval(fetchUnread, UNREAD_POLL_MS);
     return () => clearInterval(id);
-  }, [auth]);
+  }, [userId]);
 
   // Load conversation + mark as read on user select
   useEffect(() => {
@@ -90,7 +131,7 @@ export default function ChatPage() {
     }).catch(() => {});
   }, [selectedUser]);
 
-  // Message polling + notifications
+  // Message polling + notifications (and socket delivers single messages here too)
   const handleNewMessages = useCallback(
     (incoming: MessageDto[]) => {
       const current = selectedUserRef.current;
@@ -135,7 +176,17 @@ export default function ChatPage() {
     []
   );
 
-  usePolling(!!auth, MSG_POLL_MS, handleNewMessages);
+  const handleNewMessagesRef = useRef(handleNewMessages);
+  handleNewMessagesRef.current = handleNewMessages;
+
+  const wsUrl = getWsUrl();
+  const { isConnected: socketConnected, sendMessage: socketSendMessage } = useChatSocket({
+    wsUrl,
+    token: auth?.token ?? null,
+    onNewMessage: (msg) => handleNewMessagesRef.current([msg]),
+  });
+
+  usePolling(!!auth && !socketConnected, MSG_POLL_MS, handleNewMessages);
 
   // Offline queue
   const { enqueue, flush } = useOfflineQueue(() => {
@@ -167,10 +218,17 @@ export default function ChatPage() {
     }
 
     try {
-      const saved = await api.sendMessage(selectedUser.id, content, clientId, replyToId);
-      setMessages((prev) =>
-        prev.map((m) => (m.clientId === clientId ? saved : m))
-      );
+      let saved: MessageDto | null = null;
+      if (socketConnected)
+        saved = await socketSendMessage(selectedUser.id, content, clientId, replyToId);
+      if (!saved)
+        saved = await api.sendMessage(selectedUser.id, content, clientId, replyToId);
+      if (saved)
+        setMessages((prev) =>
+          prev.map((m) => (m.clientId === clientId ? saved! : m))
+        );
+      else
+        enqueue({ clientId, recipientId: selectedUser.id, content, replyToId });
     } catch {
       enqueue({ clientId, recipientId: selectedUser.id, content, replyToId });
     }
@@ -220,18 +278,24 @@ export default function ChatPage() {
         <div className="mt-2 flex items-center justify-between px-4 py-1.5">
           <span className="text-xs font-semibold tracking-wide text-gray-400 uppercase">Direct Messages</span>
           <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] font-bold text-gray-400">
-            {users.length}
+            {usersLoaded ? users.length : "—"}
           </span>
         </div>
 
         {/* User list */}
         <div className="flex-1 overflow-y-auto">
-          <UserList
-            users={users}
-            selectedId={selectedUser?.id ?? null}
-            unreadCounts={unreadCounts}
-            onSelect={setSelectedUser}
-          />
+          {!usersLoaded ? (
+            <div className="px-4 py-6 text-center text-sm text-gray-500">
+              Loading…
+            </div>
+          ) : (
+            <UserList
+              users={users}
+              selectedId={selectedUser?.id ?? null}
+              unreadCounts={unreadCounts}
+              onSelect={setSelectedUser}
+            />
+          )}
         </div>
 
         {/* Current user footer */}

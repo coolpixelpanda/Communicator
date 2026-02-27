@@ -1,11 +1,14 @@
 import { randomBytes, pbkdf2Sync } from "crypto";
 import jwt from "jsonwebtoken";
 import { get as getBlob, put as putBlob } from "@vercel/blob";
+import { kv } from "@vercel/kv";
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 const JWT_SECRET = process.env.JWT_SECRET || "ThisIsA32CharSecretKeyForDevOnly!";
 const JWT_ISSUER = "Communicator";
 const BLOB_PREFIX = "communicator";
+const KV_USERS_KEY = "communicator:users";
+const KV_MESSAGES_KEY = "communicator:messages";
 
 type UserRow = { id: string; username: string; passwordHash: string };
 type MessageRow = {
@@ -19,11 +22,30 @@ type MessageRow = {
   replyToId: string | null;
 };
 
-// In-memory store (loaded from Blob when BLOB_READ_WRITE_TOKEN is set)
+// In-memory store (loaded from KV or Blob on each request when persistence is configured)
 const users = new Map<string, UserRow>();
 const usernameToId = new Map<string, string>();
 const messages: MessageRow[] = [];
 const clientIds = new Set<string>();
+
+const hasKV = !!(process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN);
+const hasBlob = !!process.env.BLOB_READ_WRITE_TOKEN;
+
+function applyUsersToList(list: UserRow[]): void {
+  users.clear();
+  usernameToId.clear();
+  for (const u of list) {
+    users.set(u.id, u);
+    usernameToId.set(u.username.toLowerCase(), u.id);
+  }
+}
+
+function applyMessagesToList(list: MessageRow[]): void {
+  messages.length = 0;
+  messages.push(...list);
+  clientIds.clear();
+  for (const m of list) if (m.clientId) clientIds.add(m.clientId);
+}
 
 async function streamToText(stream: ReadableStream<Uint8Array>): Promise<string> {
   const chunks: Uint8Array[] = [];
@@ -40,63 +62,90 @@ async function streamToText(stream: ReadableStream<Uint8Array>): Promise<string>
   }
 }
 
-async function loadPersistedData(): Promise<void> {
-  const token = process.env.BLOB_READ_WRITE_TOKEN;
-  if (!token) return;
+/** Load users and messages from KV (every request so list is always correct). */
+async function loadFromKV(): Promise<void> {
+  if (!hasKV) return;
+  try {
+    const [usersList, messagesList] = await Promise.all([
+      kv.get<UserRow[]>(KV_USERS_KEY),
+      kv.get<MessageRow[]>(KV_MESSAGES_KEY),
+    ]);
+    if (Array.isArray(usersList)) applyUsersToList(usersList);
+    if (Array.isArray(messagesList)) applyMessagesToList(messagesList);
+  } catch (e) {
+    console.error("KV load error:", e);
+  }
+}
 
+/** Load from Blob (used when KV is not configured). */
+async function loadFromBlob(): Promise<void> {
+  if (!hasBlob) return;
   try {
     const [usersBlob, messagesBlob] = await Promise.all([
       getBlob({ urlOrPathname: `${BLOB_PREFIX}/users.json`, access: "private" as const }),
       getBlob({ urlOrPathname: `${BLOB_PREFIX}/messages.json`, access: "private" as const }),
     ]);
-
     if (usersBlob && "stream" in usersBlob && usersBlob.stream) {
       const text = await streamToText(usersBlob.stream as ReadableStream<Uint8Array>);
       const list = JSON.parse(text || "[]") as UserRow[];
-      users.clear();
-      usernameToId.clear();
-      for (const u of list) {
-        users.set(u.id, u);
-        usernameToId.set(u.username.toLowerCase(), u.id);
-      }
+      applyUsersToList(list);
     }
-
     if (messagesBlob && "stream" in messagesBlob && messagesBlob.stream) {
       const text = await streamToText(messagesBlob.stream as ReadableStream<Uint8Array>);
       const list = JSON.parse(text || "[]") as MessageRow[];
-      messages.length = 0;
-      messages.push(...list);
-      for (const m of list) if (m.clientId) clientIds.add(m.clientId);
+      applyMessagesToList(list);
     }
   } catch (e) {
     console.error("Blob load error:", e);
   }
 }
 
-async function saveUsersToBlob(): Promise<void> {
-  if (!process.env.BLOB_READ_WRITE_TOKEN) return;
-  try {
-    const list = Array.from(users.values());
-    await putBlob(`${BLOB_PREFIX}/users.json`, JSON.stringify(list), {
-      access: "private",
-      addRandomSuffix: false,
-      allowOverwrite: true,
-    });
-  } catch (e) {
-    console.error("Blob save users error:", e);
+/** Load persisted data at start of request so registered accounts and list are correct. */
+async function loadPersistedData(): Promise<void> {
+  if (hasKV) await loadFromKV();
+  else if (hasBlob) await loadFromBlob();
+}
+
+async function saveUsers(): Promise<void> {
+  const list = Array.from(users.values());
+  if (hasKV) {
+    try {
+      await kv.set(KV_USERS_KEY, list);
+    } catch (e) {
+      console.error("KV save users error:", e);
+    }
+  }
+  if (hasBlob) {
+    try {
+      await putBlob(`${BLOB_PREFIX}/users.json`, JSON.stringify(list), {
+        access: "private",
+        addRandomSuffix: false,
+        allowOverwrite: true,
+      });
+    } catch (e) {
+      console.error("Blob save users error:", e);
+    }
   }
 }
 
-async function saveMessagesToBlob(): Promise<void> {
-  if (!process.env.BLOB_READ_WRITE_TOKEN) return;
-  try {
-    await putBlob(`${BLOB_PREFIX}/messages.json`, JSON.stringify(messages), {
-      access: "private",
-      addRandomSuffix: false,
-      allowOverwrite: true,
-    });
-  } catch (e) {
-    console.error("Blob save messages error:", e);
+async function saveMessages(): Promise<void> {
+  if (hasKV) {
+    try {
+      await kv.set(KV_MESSAGES_KEY, messages);
+    } catch (e) {
+      console.error("KV save messages error:", e);
+    }
+  }
+  if (hasBlob) {
+    try {
+      await putBlob(`${BLOB_PREFIX}/messages.json`, JSON.stringify(messages), {
+        access: "private",
+        addRandomSuffix: false,
+        allowOverwrite: true,
+      });
+    } catch (e) {
+      console.error("Blob save messages error:", e);
+    }
   }
 }
 
@@ -155,8 +204,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   cors(req, res);
   if (req.method === "OPTIONS") return res.status(204).end();
 
-  // Load persisted users/messages from Vercel Blob when token is set and store is empty
-  if (process.env.BLOB_READ_WRITE_TOKEN && users.size === 0) {
+  // Load persisted users/messages on every request so registered accounts and DM list are always correct
+  if (hasKV || hasBlob) {
     await loadPersistedData();
   }
 
@@ -178,7 +227,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       const id = uuid();
       users.set(id, { id, username: name, passwordHash: hashPassword(password) });
       usernameToId.set(key, id);
-      await saveUsersToBlob();
+      await saveUsers();
       const token = createToken(id, name);
       return res.status(200).json({ token, userId: id, username: name });
     }
@@ -244,7 +293,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         replyToId: replyToId || null,
       };
       messages.push(msg);
-      await saveMessagesToBlob();
+      await saveMessages();
       return res.status(200).json(msg);
     }
 
@@ -288,7 +337,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           count++;
         }
       }
-      await saveMessagesToBlob();
+      await saveMessages();
       return res.status(200).json({ markedRead: count });
     }
 

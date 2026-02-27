@@ -1,6 +1,8 @@
 using System.Security.Claims;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.SignalR;
+using Communicator.Api.Hubs;
 using Communicator.Api.Models;
 using Communicator.Api.Services;
 
@@ -9,10 +11,10 @@ namespace Communicator.Api.Controllers;
 [ApiController]
 [Route("api/[controller]")]
 [Authorize]
-public class MessagesController(MessageStore messages, UserStore users) : ControllerBase
+public class MessagesController(MessageStore messages, UserStore users, IHubContext<ChatHub> hub) : ControllerBase
 {
     [HttpPost]
-    public IActionResult Send([FromBody] SendMessageRequest request)
+    public async Task<IActionResult> Send([FromBody] SendMessageRequest request)
     {
         var senderId = Guid.Parse(User.FindFirstValue("sub")!);
 
@@ -26,7 +28,9 @@ public class MessagesController(MessageStore messages, UserStore users) : Contro
             return BadRequest(new { error = "Message content cannot be empty." });
 
         var msg = messages.Add(senderId, request.RecipientId, request.Content.Trim(), request.ClientId, request.ReplyToId);
-        return Ok(ToDto(msg!));
+        var dto = ToDto(msg!);
+        await hub.Clients.User(request.RecipientId.ToString()).SendAsync("NewMessage", dto);
+        return Ok(dto);
     }
 
     [HttpGet("conversation/{contactId:guid}")]
